@@ -1,0 +1,202 @@
+#!/usr/bin/env python
+"""
+Provides a uniform interface across different computing environments for running multiple jobs. 
+
+Basic usage examples: 
+$ multi --queue --split 0:10:1 --run "echo Job NNN > NNN.log"
+$ multi --nohup --split 0:10:1 --run "echo Job NNN > NNN.log"
+$ multi --qsub --split 0:10:1 --run "echo Job NNN"
+
+More detailed examples:
+
+Manage 20 jobs, using 4 processes at a time: 
+$ multi --queue --n-parallel 4 --split 0:200:10 --run "./g3cosmos.py --verbose --nobs 10 --first-obs NNN --input cosmos.json --save cosmos > cosmos.NNN.log"
+
+Launch 20 jobs to run in background via nohup:
+$ multi --nohup --split 0:200:10 --run "./g3cosmos.py --verbose --nobs 10 --first-obs NNN --input cosmos.json --save cosmos > cosmos.NNN.log"
+
+Launch 20 jobs via qsub:
+$ multi --qsub --N cosmos --q dm --output log --split 0:200:10 --run "./g3cosmos.py --verbose --nobs 10 --first-obs NNN --input cosmos.json --save cosmos"
+
+Created 29-Aug-2014 by Daniel Margala (University of California, Irvine) <dmargala@uci.edu>
+"""
+
+import time
+import subprocess
+import multiprocessing
+import argparse
+import math
+
+from collections import deque
+
+def runQueue(cmds, args):
+    """
+    Run commands in parallel via multiple processes
+    """
+    if args.n_parallel < 1 or args.n_parallel > multiprocessing.cpu_count():
+        print 'Invalid specification of number of parallel processes to use'
+        return
+    def launch(cmd):
+        p = subprocess.Popen(cmd, shell=True)
+        return p
+    def done(p):
+        return p.poll() is not None
+    def success(p):
+        return p.returncode == 0
+
+    processes = []
+    while True:
+        while cmds and len(processes) < args.n_parallel:
+            cmd = cmds.popleft()
+            if args.dry or args.verbose:
+                print cmd
+            if not args.dry:
+                p = launch(cmd)
+                processes.append(p)
+        for p in processes:
+            if done(p):
+                processes.remove(p)
+                if success(p):
+                    pass
+                else:
+                    pass
+        if not processes and not cmds:
+            break
+        else:
+            time.sleep(0.05)
+
+def addQueueArgs(parser):
+    """
+    Adds a set of command-line args to the parser provided that specify a self managed queue options
+    """
+    parser.add_argument("--n-parallel", type = int, default = 1,
+        help = "Queue: specify number of simultaneous processes to manage")
+
+def buildQSubString(command, N, q, pe_openmp, m, split, output, tc, checkpoint):
+    """
+    Returns queue submission script as a string
+    """
+    qsubStringList = ['#!/bin/bash']
+    # job name
+    if N: qsubStringList.append('#$ -N %s' % N)
+    # queue list
+    if q: qsubStringList.append('#$ -q %s' % q)
+    # number of cores
+    if pe_openmp: qsubStringList.append('#$ -pe openmp %d' % pe_openmp)
+    # email settings
+    if m: qsubStringList.append('#$ -m %s' % m)
+    # std out/err log file directory
+    if output: 
+        qsubStringList.append('#$ -o %s' % output)
+        qsubStringList.append('#$ -e %s' % output)
+    # always propagate our environment variables (this seems to be necessary with checkpointing)
+    qsubStringList.append('#$ -V')
+    # enable checkpointing if requested (see http://hpc.oit.uci.edu/checkpoint)
+    if checkpoint:
+        qsubStringList.append('#$ -ckpt blcr')
+        qsubStringList.append('#$ -l kernel=blcr')
+        qsubStringList.append('#$ -r y')
+    # grid engine array tasks (see http://arc.liv.ac.uk/SGE/howto/sge-array.html)
+    (start, stop, increment) = (int(i) for i in split.split(':'))
+    njobs = math.ceil(float(stop-start)/increment)
+    qsubStringList.append('#$ -t 1:%d' % njobs)
+    # limit number of concurrently running tasks
+    if tc > 0: qsubStringList.append('#$ -tc %d' % tc)
+    # query great3 base directory to warm up nfs share
+    qsubStringList.append('ls $GREAT3_ROOT > /dev/null')
+    # and finally, append the command to run
+    qsubStringList.append(command)
+    qsubString = '\n'.join(qsubStringList)
+    return qsubString
+
+def runQSub(command, args):
+    """
+    Launch jobs via HPC qsub
+    """
+    qsubString = buildQSubString(command, args.N, args.q, args.pe_openmp, args.m, 
+        args.split, args.output, args.tc, args.checkpoint)
+    if args.dry or args.verbose:
+        print qsubString
+    if not args.dry:
+        qsub = subprocess.Popen('qsub', stdin=subprocess.PIPE, shell=True)
+        qsub.communicate(qsubString)
+
+def runNohup(commands,args):
+    """
+    Launch jobs in background via nohup
+    """
+    for cmd in commands:
+        nohupCmd = 'nohup %s &' % cmd
+        if args.dry or args.verbose:
+            print nohupCmd
+        if not args.dry:
+            subprocess.call(nohupCmd, shell=True)
+
+def addQSubArgs(parser):
+    """
+    Add command-line args to the parser provided that specify HPC qsub options
+    """
+    parser.add_argument("--N", type = str, default = "",
+        help = "qsub: job name")
+    parser.add_argument("--q", type = str, default = "dm,free64",
+        help = "qsub: queue name")
+    parser.add_argument("--pe-openmp", type = int, default = 1,
+        help = "qsub: number of openmp cores to use")
+    parser.add_argument("--m", type = str, default = "",
+        help = "qsub: email options")
+    parser.add_argument("--tc", type = int, default = 0,
+        help = "qsub: restricts the number of tasks of the job that run concurrently. 0 indicates no restriction.")
+    parser.add_argument("--checkpoint", action = "store_true",
+        help = "qsub: enable checkpoints and restarting.")
+
+class mergedFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    """
+    Adds raw description text formatter function to argparse.ArgumentDefaultsHelpFormatter
+    """
+    def _fill_text(self, text, width, indent):
+        return ''.join([indent + line for line in text.splitlines(True)])
+
+def main():
+    parser = argparse.ArgumentParser(epilog=__doc__,formatter_class=mergedFormatter)
+    parser.add_argument("-v","--verbose", action = "store_true",
+        help = "provide more verbose output")
+    parser.add_argument("--split", type = str, default = '',
+        help = "specify job division using start:stop:increment")
+    parser.add_argument("--run", type = str, default = '',
+        help = "use NNN as placeholder for (start + i*increment)")
+    parser.add_argument("--dry", action="store_true",
+        help = "performs dry run, only prints commands")
+    parser.add_argument("--qsub", action = "store_true",
+        help = "submit jobs via qsub (hpc style)")
+    parser.add_argument("--queue", action = "store_true",
+        help = "submit jobs via internal queue"),
+    parser.add_argument("--nohup", action = "store_true",
+        help = "submit jobs via nohup")
+    parser.add_argument("--output", type = str, default = '',
+        help = "specify output file")
+    addQSubArgs(parser)
+    addQueueArgs(parser)
+    args = parser.parse_args()
+    
+    (start, stop, increment) = (int(i) for i in args.split.split(':'))
+
+    if args.nohup:
+        commands = deque([])
+        for i in range(start, stop, increment):
+            cmd = args.run.replace('NNN',str(i))
+            commands.append(cmd)
+        runNohup(commands, args)
+    elif args.queue:
+        commands = deque([])
+        for i in range(start, stop, increment):
+            cmd = args.run.replace('NNN',str(i))
+            commands.append(cmd)
+        runQueue(commands, args)
+    elif args.qsub:
+        command = args.run.replace('NNN','$((%d+($SGE_TASK_ID-1)*%d))'%(start,increment))
+        runQSub(command, args)
+
+if __name__ == "__main__":
+    main()
+
+
